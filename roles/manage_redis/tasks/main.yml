@@ -1,0 +1,23 @@
+---
+- name: Install redis package
+  ansible.builtin.package:
+    name: redis
+
+- name: Allow connection on any interface
+  ansible.builtin.lineinfile:
+    path: "{{ redis_config_file }}"
+    regexp: "^bind "
+    state: absent
+
+- name: Disable protection
+  ansible.builtin.lineinfile:
+    path: "{{ redis_config_file }}"
+    regexp: "^protected-mode "
+    line: "protected-mode no"
+    state: present
+
+- name: Enable and start service
+  ansible.builtin.service:
+    name: redis
+    state: started
+    enabled: true
