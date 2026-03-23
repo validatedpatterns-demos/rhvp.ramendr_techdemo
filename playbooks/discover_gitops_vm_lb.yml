@@ -1,0 +1,82 @@
+---
+# Discover which managed cluster hosts a Service (gitops-vms by default), read its AWS LB/ELB
+# hostname from status.loadBalancer.ingress, and add that endpoint to Ansible inventory.
+# Does not configure Route 53 or any other routing.
+#
+# Example:
+#   ansible-playbook playbooks/discover_gitops_vm_lb.yml -e lb_hostname=rhel9-redis-001 -e inventory_name=myvm
+#
+- import_playbook: rhvp.cluster_utils.download_managed_kubeconfigs
+
+- name: Discover gitops VM LoadBalancer and add to inventory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubeconfig_dir: /tmp/kubeconfigs
+    gitops_vms_namespace: gitops-vms
+    # Service name in the namespace (defaults to lb_hostname)
+    gitops_vms_service_name: "{{ lb_hostname }}"
+    k8s_service_wait_retries: 5
+    k8s_service_wait_delay: 2
+    inventory_name: "{{ lb_hostname }}"
+    discovery_inventory_group: gitops_vms_lb
+  tasks:
+    - name: Require lb_hostname (or set gitops_vms_service_name)
+      ansible.builtin.assert:
+        that:
+          - lb_hostname | default('') | length > 0
+        fail_msg: Pass -e lb_hostname=<name> (used as Service name unless gitops_vms_service_name is set).
+
+    - name: Discover kubeconfig files under kubeconfig_dir
+      ansible.builtin.find:
+        paths: "{{ kubeconfig_dir }}"
+        patterns: "*.yaml"
+        file_type: file
+      register: kubeconfig_find
+
+    - name: Build managed cluster name list from kubeconfig files
+      ansible.builtin.set_fact:
+        managed_cluster_names: >-
+          {{
+            kubeconfig_find.files
+            | map(attribute='path')
+            | map('basename')
+            | map('regex_replace', '\.yaml$', '')
+            | reject('equalto', 'local-cluster')
+            | list
+          }}
+
+    - name: Assert managed kubeconfigs exist
+      ansible.builtin.assert:
+        that:
+          - managed_cluster_names | length > 0
+        fail_msg: >-
+          No *.yaml kubeconfigs under {{ kubeconfig_dir }}.
+          Ensure download_managed_kubeconfigs ran and kubeconfig_dir is correct.
+
+    - name: Probe clusters in order until Service LoadBalancer is found
+      ansible.builtin.include_tasks: tasks/discover_gitops_lb_on_cluster.yml
+      loop: "{{ managed_cluster_names }}"
+      loop_control:
+        label: "{{ item }}"
+      when: not vm_service_discovered | default(false)
+
+    - name: Assert Service was found on some cluster
+      ansible.builtin.assert:
+        that:
+          - vm_service_discovered | default(false) | bool
+        fail_msg: >-
+          No Service {{ gitops_vms_service_name }} with LoadBalancer ingress in {{ gitops_vms_namespace }}
+          on any managed cluster ({{ managed_cluster_names | join(', ') }}).
+
+    - name: Add discovered LoadBalancer to in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ inventory_name }}"
+        ansible_host: "{{ inventory_ansible_host }}"
+        groups:
+          - "{{ discovery_inventory_group }}"
+        discovered_cluster: "{{ discovered_cluster }}"
+      when:
+        - inventory_name | default('') | length > 0
+        - inventory_ansible_host | default('') | length > 0

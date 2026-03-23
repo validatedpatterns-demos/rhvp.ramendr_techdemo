@@ -1,0 +1,46 @@
+---
+# Query each authoritative NS for A records; first IPv4 answer wins (nameserver order).
+- name: "Query authoritative NS for A records ({{ resolve_item.fqdn }})"
+  ansible.builtin.command:
+    argv:
+      - dig
+      - +short
+      - "@{{ ns_item }}"
+      - "{{ resolve_item.fqdn }}"
+      - A
+  loop: "{{ authoritative_ns }}"
+  loop_control:
+    loop_var: ns_item
+  register: ns_a_queries
+  changed_when: false
+  failed_when: false
+
+- name: "Pick first valid IPv4 for {{ resolve_item.fqdn }}"
+  ansible.builtin.set_fact:
+    resolved_node_ip: >-
+      {{
+        ns_a_queries.results
+        | map(attribute='stdout_lines')
+        | flatten
+        | map('trim')
+        | reject('equalto', '')
+        | select('match', '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')
+        | list
+        | first
+        | default('', true)
+      }}
+
+- name: Add discovered IPv4 host to inventory group node
+  ansible.builtin.add_host:
+    name: "{{ resolved_node_ip }}"
+    groups:
+      - node
+    ansible_host: "{{ resolved_node_ip }}"
+  when: resolved_node_ip | length > 0
+
+- name: "No A record from any NS for {{ resolve_item.fqdn }}"
+  ansible.builtin.debug:
+    msg: >-
+      No IPv4 A record returned from any of {{ authoritative_ns | length }} nameserver(s)
+      for {{ resolve_item.fqdn }}; check DNS and hostname.
+  when: resolved_node_ip | default('') | length == 0

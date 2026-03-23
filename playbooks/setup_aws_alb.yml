@@ -11,7 +11,7 @@
   tasks:
     - name: Discover local kubeconfigs
       ansible.builtin.set_fact:
-        kuebconfig_files: "{{ lookup('ansible.builtin.fileglob', kubeconfig_dir + '/*.yaml', wantlist=True) | list }}"
+        kubeconfig_files: "{{ lookup('ansible.builtin.fileglob', kubeconfig_dir + '/*.yaml', wantlist=True) | list }}"
 
     - name: Show local kubeconfigs
       ansible.builtin.debug:

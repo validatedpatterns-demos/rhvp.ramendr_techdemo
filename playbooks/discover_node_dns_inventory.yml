@@ -1,0 +1,126 @@
+---
+# Requires hub cluster context in KUBECONFIG (or default kubeconfig).
+# Writes managed kubeconfigs under kubeconfig_dir (default /tmp/kubeconfigs), same as setup_aws_alb.
+# Resolves lb_hostname.<cluster_domain> per managed cluster by querying NS for base_domain, then A @ each NS.
+#
+# Run from collection/repo root, for example:
+#   ansible-playbook playbooks/discover_node_dns_inventory.yml
+# Optional: -e lb_hostname=myhost -e kubeconfig_dir=/tmp/kubeconfigs
+#
+- name: Download managed cluster kubeconfigs
+  import_playbook: rhvp.cluster_utils.download_managed_kubeconfigs
+
+- name: Discover cluster domains and node IPs via authoritative DNS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubeconfig_dir: /tmp/kubeconfigs
+    lb_hostname: rhel9-redis-001
+  tasks:
+    - name: Require dig for NS/A queries
+      ansible.builtin.command:
+        argv:
+          - command
+          - -v
+          - dig
+      changed_when: false
+
+    - name: Read hub cluster ingress domain (hub kubeconfig from environment)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Ingress
+        name: cluster
+      register: hub_ingress
+
+    - name: Set hub base domain (same logic as setup_aws_alb)
+      ansible.builtin.set_fact:
+        base_domain: "{{ (hub_ingress.resources[0].spec.domain | split('.'))[2:] | join('.') ~ '.' }}"
+
+    - name: List managed cluster kubeconfig files
+      ansible.builtin.find:
+        paths: "{{ kubeconfig_dir }}"
+        patterns: "*.yaml"
+        file_type: file
+      register: kubeconfig_find
+
+    - name: Build managed cluster name list from kubeconfig files
+      ansible.builtin.set_fact:
+        managed_cluster_names: >-
+          {{
+            kubeconfig_find.files
+            | map(attribute='path')
+            | map('basename')
+            | map('regex_replace', '\.yaml$', '')
+            | reject('equalto', 'local-cluster')
+            | list
+          }}
+
+    - name: Assert managed kubeconfigs exist
+      ansible.builtin.assert:
+        that:
+          - managed_cluster_names | length > 0
+        fail_msg: >-
+          No *.yaml kubeconfigs under {{ kubeconfig_dir }}.
+          Ensure download_managed_kubeconfigs ran and kubeconfig_dir is correct.
+
+    - name: Fetch ingress domain per managed cluster
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Ingress
+        name: cluster
+      environment:
+        KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}.yaml"
+      register: managed_ingress_results
+      loop: "{{ managed_cluster_names }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Build FQDN list for DNS resolution
+      ansible.builtin.set_fact:
+        node_resolve_targets: "{{ node_resolve_targets | default([]) + [_entry] }}"
+      vars:
+        _cluster_domain: "{{ item.resources[0].spec.domain | regex_replace('^apps.', '') }}"
+        _entry:
+          cluster: "{{ item.item }}"
+          cluster_domain: "{{ _cluster_domain }}"
+          fqdn: "{{ lb_hostname }}.{{ _cluster_domain }}"
+      loop: "{{ managed_ingress_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Resolve NS records for base domain
+      ansible.builtin.command:
+        argv:
+          - dig
+          - +short
+          - NS
+          - "{{ base_domain }}"
+      register: ns_dig
+      changed_when: false
+
+    - name: Build authoritative nameserver list
+      ansible.builtin.set_fact:
+        authoritative_ns: >-
+          {{
+            ns_dig.stdout_lines
+            | map('trim')
+            | reject('equalto', '')
+            | map('regex_replace', '\.$', '')
+            | list
+          }}
+
+    - name: Assert nameservers were returned
+      ansible.builtin.assert:
+        that:
+          - authoritative_ns | length > 0
+        fail_msg: >-
+          No NS records returned for {{ base_domain }} (dig rc={{ ns_dig.rc }}).
+          Check base_domain and resolver access.
+
+    - name: Resolve each node FQDN via authoritative NS and add to group node
+      ansible.builtin.include_tasks: tasks/resolve_fqdn_via_authoritative_ns.yml
+      loop: "{{ node_resolve_targets }}"
+      loop_control:
+        loop_var: resolve_item
+        label: "{{ resolve_item.fqdn }}"

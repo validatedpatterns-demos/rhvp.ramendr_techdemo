@@ -1,0 +1,40 @@
+---
+# Included with loop_var item = managed cluster name (kubeconfig basename without .yaml).
+- name: Wait for Service LoadBalancer on cluster {{ item }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    name: "{{ gitops_vms_service_name }}"
+    namespace: "{{ gitops_vms_namespace }}"
+  environment:
+    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}.yaml"
+  register: _gitops_svc_probe
+  until: >-
+    _gitops_svc_probe.resources | default([]) | length > 0
+    and (
+      (
+        _gitops_svc_probe.resources[0].status.loadBalancer.ingress | default([])
+        | first | default({})
+      ).hostname | default('')
+      | length > 0
+      or (
+        _gitops_svc_probe.resources[0].status.loadBalancer.ingress | default([])
+        | first | default({})
+      ).ip | default('')
+      | length > 0
+    )
+  retries: "{{ k8s_service_wait_retries | int }}"
+  delay: "{{ k8s_service_wait_delay | int }}"
+  ignore_errors: true
+
+- name: Record which cluster runs the Service and the LB DNS name
+  ansible.builtin.set_fact:
+    vm_service_discovered: true
+    discovered_cluster: "{{ item }}"
+    inventory_ansible_host: "{{ _ingress.hostname | default(_ingress.ip, true) | regex_replace('[.]$', '') }}"
+  vars:
+    _ingress: "{{ _gitops_svc_probe.resources[0].status.loadBalancer.ingress | default([]) | first | default({}) }}"
+  when:
+    - not (_gitops_svc_probe.failed | default(false))
+    - _gitops_svc_probe.resources | default([]) | length > 0
+    - (_ingress.hostname | default('') | length > 0) or (_ingress.ip | default('') | length > 0)
