@@ -1,0 +1,17 @@
+---
+- name: Configure hostname to discover
+  hosts: localhost
+  become: false
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Set lb_hostname variable
+      ansible.builtin.set_fact:
+        lb_hostname: rhel9-redis-001
+        ansible_user: cloud-user
+
+- name: Discover node to configure
+  ansible.builtin.import_playbook: discover_gitops_vm_lb.yml
+
+- name: Configure node
+  ansible.builtin.import_playbook: redis_node_install.yml

@@ -1,0 +1,129 @@
+---
+- name: Normalize DNS names for Route53 lookups
+  ansible.builtin.set_fact:
+    r53_zone_dns_name: "{{ route53_zone if route53_zone.endswith('.') else (route53_zone + '.') }}"
+    r53_alb_name: "{{ route53_alb_record if route53_alb_record.endswith('.') else (route53_alb_record + '.') }}"
+
+# list_by_name can return a different top-level shape depending on collection/API;
+# list always returns hosted_zones (then we pick the zone by name).
+- name: Resolve hosted zone ID for record lookup
+  amazon.aws.route53_info:
+    query: hosted_zone
+    hosted_zone_method: list
+  register: r53_hosted_zone_lookup
+
+- name: Pick hosted zone matching zone name
+  ansible.builtin.set_fact:
+    r53_hosted_zone_match: >-
+      {{
+        (
+          r53_hosted_zone_lookup.hosted_zones
+          | selectattr('name', 'equalto', r53_zone_dns_name)
+          | list
+          | first
+        )
+        | default({})
+      }}
+
+- name: Assert hosted zone exists for this DNS name
+  ansible.builtin.assert:
+    that:
+      - r53_hosted_zone_lookup.hosted_zones is defined
+      - r53_hosted_zone_lookup.hosted_zones | length > 0
+      - r53_hosted_zone_match.id is defined
+    fail_msg: >-
+      Could not find a hosted zone named {{ r53_zone_dns_name }} in this account.
+      Check AWS credentials and zone name (must match Route 53, usually with a trailing dot).
+
+- name: Set hosted zone id for record_sets query
+  ansible.builtin.set_fact:
+    r53_hosted_zone_id: "{{ r53_hosted_zone_match.id | regex_replace('/hostedzone/', '') }}"
+
+- name: Fetch CNAME record sets (includes PRIMARY failover HealthCheckId)
+  amazon.aws.route53_info:
+    query: record_sets
+    hosted_zone_id: "{{ r53_hosted_zone_id }}"
+    start_record_name: "{{ r53_alb_name }}"
+    type: CNAME
+  register: r53_records_for_delete
+
+# amazon.aws.route53 does not copy HealthCheckId from AWS onto DELETE requests; you must pass health_check.
+- name: Capture health check ID from existing PRIMARY failover record
+  ansible.builtin.set_fact:
+    primary_rr_health_check_id: >-
+      {{
+        (
+          r53_records_for_delete.resource_record_sets
+          | selectattr('failover', 'defined')
+          | selectattr('failover', 'equalto', 'PRIMARY')
+          | list | first | default({})
+        ).health_check_id | default('')
+      }}
+
+- name: Prefer route53_primary_health_check_id extra var when set (override lookup)
+  ansible.builtin.set_fact:
+    primary_rr_health_check_id: "{{ route53_primary_health_check_id | default(primary_rr_health_check_id, true) }}"
+
+- name: Detect if PRIMARY failover record still exists
+  ansible.builtin.set_fact:
+    primary_failover_exists: >-
+      {{
+        (
+          r53_records_for_delete.resource_record_sets
+          | selectattr('failover', 'defined')
+          | selectattr('failover', 'equalto', 'PRIMARY')
+          | list
+          | length
+        ) > 0
+      }}
+
+- name: Require HealthCheckId before deleting PRIMARY failover record
+  ansible.builtin.assert:
+    that:
+      - primary_rr_health_check_id | length > 0
+    fail_msg: >-
+      Could not read HealthCheckId for the PRIMARY failover record from Route 53.
+      Fix record_sets lookup (name/type), or pass -e route53_primary_health_check_id=<uuid>.
+  when: primary_failover_exists | bool
+
+# Secondary has no health check; remove it first, then primary.
+- name: Delete secondary failover CNAME
+  amazon.aws.route53:
+    state: absent
+    zone: "{{ route53_zone }}"
+    record: "{{ route53_alb_record }}"
+    type: CNAME
+    value: "{{ route53_secondary_record }}"
+    ttl: "{{ route53_ttl }}"
+    failover: SECONDARY
+    identifier: "{{ route53_failover_secondary_identifier }}"
+
+- name: Delete primary failover CNAME
+  amazon.aws.route53:
+    state: absent
+    zone: "{{ route53_zone }}"
+    record: "{{ route53_alb_record }}"
+    type: CNAME
+    value: "{{ route53_primary_record }}"
+    ttl: "{{ route53_ttl }}"
+    failover: PRIMARY
+    identifier: "{{ route53_failover_primary_identifier }}"
+    health_check: "{{ primary_rr_health_check_id }}"
+
+- name: Remove health check by ID from looked-up PRIMARY record
+  amazon.aws.route53_health_check:
+    state: absent
+    health_check_id: "{{ primary_rr_health_check_id }}"
+  when: primary_rr_health_check_id | length > 0
+
+- name: Remove health check by endpoint (fallback if record had no HealthCheckId)
+  amazon.aws.route53_health_check:
+    state: absent
+    fqdn: "{{ route53_primary_record }}"
+    port: "{{ route53_health_check_port }}"
+    type: "{{ route53_health_check_type | upper }}"
+    resource_path: "{{ omit if route53_health_check_type | upper == 'TCP' else route53_health_check_resource_path }}"
+    string_match: "{{ omit if route53_health_check_type | upper not in ['HTTP_STR_MATCH', 'HTTPS_STR_MATCH'] else route53_health_check_string_match }}"
+    request_interval: "{{ route53_health_check_request_interval }}"
+    failure_threshold: "{{ route53_health_check_failure_threshold }}"
+  when: primary_rr_health_check_id | length == 0

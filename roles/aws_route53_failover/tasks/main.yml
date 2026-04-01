@@ -1,0 +1,33 @@
+---
+- name: Resolve Route53 failover desired state
+  ansible.builtin.set_fact:
+    _route53_failover_state: "{{ route53_failover_desired_state | default(aws_desired_state | default('present'), true) }}"
+
+- name: Validate Route53 failover record variables
+  ansible.builtin.assert:
+    that:
+      - route53_zone | length > 0
+      - route53_alb_record | length > 0
+      - route53_primary_record | length > 0
+      - route53_secondary_record | length > 0
+    fail_msg: route53_zone, route53_alb_record, route53_primary_record, and route53_secondary_record are required.
+
+- name: Validate HTTP family health check parameters
+  ansible.builtin.assert:
+    that:
+      - route53_health_check_resource_path | length > 0
+      - route53_health_check_resource_path is match('^/')
+    fail_msg: >-
+      route53_health_check_resource_path must be non-empty and start with / for non-TCP health checks
+      (current type {{ route53_health_check_type }}).
+  when: route53_health_check_type | upper != 'TCP'
+
+- name: Validate string match for STR_MATCH health check types
+  ansible.builtin.assert:
+    that:
+      - route53_health_check_string_match | length > 0
+    fail_msg: route53_health_check_string_match is required for HTTP_STR_MATCH and HTTPS_STR_MATCH.
+  when: route53_health_check_type | upper in ['HTTP_STR_MATCH', 'HTTPS_STR_MATCH']
+
+- name: Include tasks for desired state
+  ansible.builtin.include_tasks: "{{ _route53_failover_state }}.yml"

@@ -1,0 +1,56 @@
+---
+# Failover records reference the health check; create health check before PRIMARY record.
+- name: Create Route53 health check for primary endpoint
+  amazon.aws.route53_health_check:
+    state: present
+    fqdn: "{{ route53_primary_record }}"
+    type: "{{ route53_health_check_type | upper }}"
+    port: "{{ route53_health_check_port }}"
+    resource_path: "{{ omit if route53_health_check_type | upper == 'TCP' else route53_health_check_resource_path }}"
+    string_match: "{{ omit if route53_health_check_type | upper not in ['HTTP_STR_MATCH', 'HTTPS_STR_MATCH'] else route53_health_check_string_match }}"
+    request_interval: "{{ route53_health_check_request_interval }}"
+    failure_threshold: "{{ route53_health_check_failure_threshold }}"
+  register: health_check_details
+
+# PRIMARY failover must include HealthCheckId; check mode cannot create a real ID.
+- name: Set health check ID for Route53 primary record
+  ansible.builtin.set_fact:
+    health_check_id: "{{ health_check_details.health_check.id }}"
+  when:
+    - not ansible_check_mode
+
+- name: Assert health check ID exists (required for non-alias PRIMARY failover)
+  ansible.builtin.assert:
+    that:
+      - health_check_id is defined
+      - health_check_id | length > 0
+    fail_msg: >-
+      Route53 PRIMARY failover CNAMEs must reference a health check ID.
+      Run without --check, and ensure Create Route53 health check ran (see register health_check_details).
+  when: not ansible_check_mode
+
+- name: Create secondary failover CNAME (before primary)
+  amazon.aws.route53:
+    state: present
+    zone: "{{ route53_zone }}"
+    record: "{{ route53_alb_record }}"
+    type: CNAME
+    value: "{{ route53_secondary_record }}"
+    ttl: "{{ route53_ttl }}"
+    failover: SECONDARY
+    identifier: "{{ route53_failover_secondary_identifier }}"
+    overwrite: true
+
+- name: Create primary failover CNAME (with health check)
+  amazon.aws.route53:
+    state: present
+    zone: "{{ route53_zone }}"
+    record: "{{ route53_alb_record }}"
+    type: CNAME
+    value: "{{ route53_primary_record }}"
+    ttl: "{{ route53_ttl }}"
+    identifier: "{{ route53_failover_primary_identifier }}"
+    failover: PRIMARY
+    health_check: "{{ health_check_id }}"
+    overwrite: true
+  when: not ansible_check_mode

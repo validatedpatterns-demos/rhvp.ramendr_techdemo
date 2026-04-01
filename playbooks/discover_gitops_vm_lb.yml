@@ -1,10 +1,23 @@
 ---
-# Discover which managed cluster hosts a Service (gitops-vms by default), read its AWS LB/ELB
-# hostname from status.loadBalancer.ingress, and add that endpoint to Ansible inventory.
+# Discover which managed cluster hosts a Service (gitops-vms by default), read AWS LB/ELB
+# hostname or IP from status.loadBalancer.ingress. When ingress is a hostname, resolve that
+# FQDN to an IPv4 with system DNS (dig, no @server — uses resolv.conf) for ansible_host.
 # Does not configure Route 53 or any other routing.
 #
 # Example:
 #   ansible-playbook playbooks/discover_gitops_vm_lb.yml -e lb_hostname=rhel9-redis-001 -e inventory_name=myvm
+# Optional: -e gitops_vm_lb_ansible_user=ec2-user (default cloud-user)
+# Optional: -e gitops_vm_lb_k8s_validate_certs=true to verify Kubernetes API TLS (default off)
+# Optional: -e gitops_vm_lb_k8s_context=<exact-context-name> only when you must override the kubeconfig's
+#   current-context (must match a name under contexts:). By default context is omitted so the file's
+#   current-context is used — do not assume it equals the kubeconfig basename (e.g. mjrtd-1.yaml).
+# 401 Unauthorized: refresh kubeconfig tokens; ensure the play inherits PATH/HOME (tasks set them via
+#   lookup('env')). For cloud exec auth add e.g. -e '{"gitops_vm_lb_k8s_extra_env":{"AWS_PROFILE":"..."}}'
+#
+# TLS / x509 "certificate signed by unknown authority" (oc or kubectl): the CA data in kubeconfig may be
+#   stale or wrong — re-download from the hub (rhvp.cluster_utils.download_managed_kubeconfigs), or test with
+#   oc --insecure-skip-tls-verify. Ansible kubernetes.core uses gitops_vm_lb_k8s_validate_certs (default false)
+#   so module calls can skip verify without fixing the file; oc always uses kubeconfig TLS unless you skip as above.
 #
 - import_playbook: rhvp.cluster_utils.download_managed_kubeconfigs
 
@@ -17,10 +30,17 @@
     gitops_vms_namespace: gitops-vms
     # Service name in the namespace (defaults to lb_hostname)
     gitops_vms_service_name: "{{ lb_hostname }}"
-    k8s_service_wait_retries: 5
-    k8s_service_wait_delay: 2
+    k8s_service_wait_retries: 30
+    k8s_service_wait_delay: 5
+    # Set true to print namespace Service names and API messages per cluster (troubleshooting).
+    gitops_vm_lb_debug: false
     inventory_name: "{{ lb_hostname }}"
     discovery_inventory_group: gitops_vms_lb
+    gitops_vm_lb_ansible_user: cloud-user
+    # Default off; set true to verify TLS for the Kubernetes API.
+    gitops_vm_lb_k8s_validate_certs: false
+    # Extra env for k8s_info (e.g. AWS_PROFILE, AZURE_CONFIG_DIR) if exec auth needs it.
+    gitops_vm_lb_k8s_extra_env: {}
   tasks:
     - name: Require lb_hostname (or set gitops_vms_service_name)
       ansible.builtin.assert:
@@ -69,14 +89,18 @@
         fail_msg: >-
           No Service {{ gitops_vms_service_name }} with LoadBalancer ingress in {{ gitops_vms_namespace }}
           on any managed cluster ({{ managed_cluster_names | join(', ') }}).
+          Check metadata.name matches -e lb_hostname / gitops_vms_service_name, namespace, and that the Service type is LoadBalancer.
+          Re-run with -e gitops_vm_lb_debug=true to list Service names seen in the namespace per cluster.
 
     - name: Add discovered LoadBalancer to in-memory inventory
       ansible.builtin.add_host:
         name: "{{ inventory_name }}"
         ansible_host: "{{ inventory_ansible_host }}"
+        ansible_user: "{{ gitops_vm_lb_ansible_user }}"
         groups:
           - "{{ discovery_inventory_group }}"
         discovered_cluster: "{{ discovered_cluster }}"
+        discovered_lb_fqdn: "{{ discovered_lb_fqdn | default('') }}"
       when:
         - inventory_name | default('') | length > 0
         - inventory_ansible_host | default('') | length > 0

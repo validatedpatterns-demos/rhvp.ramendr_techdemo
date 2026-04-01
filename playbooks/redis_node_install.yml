@@ -1,14 +1,12 @@
 ---
 - name: Redis Node Management
-  hosts: all
+  hosts: 'all:!localhost'
   gather_facts: true
   become: true
   vars:
     subscription_manager_rhsm_username: '{{ rhsm_username }}'
     subscription_manager_rhsm_password: '{{ rhsm_password }}'
     subscription_manager_no_log_setting: '{{ no_log_setting | default(true) }}'
-    install_mesh_node_aap_hostname: "{{ aap_hostname }}"
-    install_mesh_node_aap_password: "{{ aap_password }}"
   tasks:
     - name: Register RHEL and Manage Redis
       ansible.builtin.include_role:

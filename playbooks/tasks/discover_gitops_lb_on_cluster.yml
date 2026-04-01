@@ -1,40 +1,230 @@
 ---
 # Included with loop_var item = managed cluster name (kubeconfig basename without .yaml).
-- name: Wait for Service LoadBalancer on cluster {{ item }}
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: Service
-    name: "{{ gitops_vms_service_name }}"
-    namespace: "{{ gitops_vms_namespace }}"
-  environment:
-    KUBECONFIG: "{{ kubeconfig_dir }}/{{ item }}.yaml"
-  register: _gitops_svc_probe
-  until: >-
-    _gitops_svc_probe.resources | default([]) | length > 0
-    and (
-      (
-        _gitops_svc_probe.resources[0].status.loadBalancer.ingress | default([])
-        | first | default({})
-      ).hostname | default('')
-      | length > 0
-      or (
-        _gitops_svc_probe.resources[0].status.loadBalancer.ingress | default([])
-        | first | default({})
-      ).ip | default('')
-      | length > 0
-    )
-  retries: "{{ k8s_service_wait_retries | int }}"
-  delay: "{{ k8s_service_wait_delay | int }}"
-  ignore_errors: true
+# Service may exist on only one managed cluster; a missing Service on others is expected — do not fail.
+# Discovery lists all Services in the namespace (no get-by-name) then matches metadata.name — more reliable
+# across API/RBAC quirks. Name match: exact first, then lowercase (Kubernetes names are DNS labels).
+#
+# kubernetes.core: kubeconfig + PATH/HOME/USER + optional gitops_vm_lb_k8s_extra_env for exec auth.
+# context only if gitops_vm_lb_k8s_context is set (otherwise kubeconfig current-context).
+#
+# status.loadBalancer may be null until the cloud assigns an endpoint; bracket + default for null loadBalancer.
+- name: Kubernetes API queries for Service on cluster {{ item }}
+  block:
+    - name: Reset per-cluster discovery state (avoid stale facts from prior loop iteration)
+      ansible.builtin.set_fact:
+        _gitops_picked_svc: "{{ none }}"
 
-- name: Record which cluster runs the Service and the LB DNS name
-  ansible.builtin.set_fact:
-    vm_service_discovered: true
-    discovered_cluster: "{{ item }}"
-    inventory_ansible_host: "{{ _ingress.hostname | default(_ingress.ip, true) | regex_replace('[.]$', '') }}"
+    - name: List all Services in namespace {{ gitops_vms_namespace }} on cluster {{ item }}
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        namespace: "{{ gitops_vms_namespace }}"
+        validate_certs: "{{ gitops_vm_lb_k8s_validate_certs | default(false) | bool }}"
+        kubeconfig: "{{ _gitops_kubeconfig_path }}"
+        context: "{{ gitops_vm_lb_k8s_context | default(omit, true) }}"
+      environment: "{{ _gitops_k8s_env }}"
+      register: _gitops_svc_list_raw
+      failed_when: false
+
+    - name: Match Service by name (exact, then lowercase) from namespace list
+      ansible.builtin.set_fact:
+        # to_json|from_json avoids Ansible stringifying the Service dict in "{{ ... }}" (str has no .metadata)
+        _gitops_picked_svc: "{{ _picked_var | to_json | from_json if _picked_var is not none else none }}"
+      vars:
+        _list_res: "{{ _gitops_svc_list_raw.resources | default([]) }}"
+        _want: "{{ gitops_vms_service_name | string }}"
+        _exact: "{{ _list_res | selectattr('metadata.name', 'equalto', _want) | list }}"
+        _lower: "{{ _list_res | selectattr('metadata.name', 'equalto', _want | lower) | list }}"
+        _picked_var: "{{ (_exact | first | default(none, true)) if (_exact | length > 0) else (_lower | first | default(none, true)) }}"
+      when: not (_gitops_svc_list_raw.failed | default(false))
+
+    - name: Build _gitops_svc_lookup from list API result (always when list succeeded)
+      ansible.builtin.set_fact:
+        _gitops_svc_lookup:
+          resources: "{{ [_gitops_picked_svc] if (_gitops_picked_svc is not none and _gitops_picked_svc is mapping) else [] }}"
+          failed: false
+      when: not (_gitops_svc_list_raw.failed | default(false))
+
+    - name: Set resolved Service name for wait/get when a Service matched
+      ansible.builtin.set_fact:
+        _gitops_resolved_service_name: "{{ _gitops_picked_svc['metadata']['name'] }}"
+      when:
+        - not (_gitops_svc_list_raw.failed | default(false))
+        - _gitops_picked_svc is not none
+        - _gitops_picked_svc is mapping
+
+    - name: Record list API failure as empty lookup
+      ansible.builtin.set_fact:
+        _gitops_svc_lookup:
+          resources: []
+          failed: true
+          msg: "{{ _gitops_svc_list_raw.msg | default('Kubernetes API error') }}"
+      when: _gitops_svc_list_raw.failed | default(false)
+
+    - name: Debug Service discovery on cluster {{ item }}
+      ansible.builtin.debug:
+        msg:
+          cluster: "{{ item }}"
+          kubeconfig: "{{ _gitops_kubeconfig_path }}"
+          namespace: "{{ gitops_vms_namespace }}"
+          want_service: "{{ gitops_vms_service_name }}"
+          list_api_failed: "{{ _gitops_svc_list_raw.failed | default(false) }}"
+          list_api_msg: "{{ _gitops_svc_list_raw.msg | default('') }}"
+          service_names_in_namespace: "{{ _gitops_svc_list_raw.resources | default([]) | map(attribute='metadata') | map(attribute='name') | list }}"
+          matched: "{{ (_gitops_svc_lookup.resources | default([]) | length > 0) if (_gitops_svc_lookup is defined) else false }}"
+      when: gitops_vm_lb_debug | default(false) | bool
+
+    - name: Derive loadBalancer.ingress from lookup (safe when loadBalancer is null)
+      ansible.builtin.set_fact:
+        _gitops_lb_ingress_list: "{{ _gitops_ingress_from_status }}"
+        _gitops_lb_has_endpoint: "{{ _gitops_has_lb_hostname_or_ip }}"
+      vars:
+        _st: "{{ _gitops_svc_lookup.resources[0].status | default({}) }}"
+        _lb: "{{ _st['loadBalancer'] | default({}, true) }}"
+        _gitops_ingress_from_status: "{{ _lb['ingress'] | default([], true) }}"
+        _first_ing: "{{ _gitops_ingress_from_status | first | default({}) }}"
+        _gitops_has_lb_hostname_or_ip: >-
+          {{
+            (_first_ing['hostname'] | default('', true) | length > 0)
+            or (_first_ing['ip'] | default('', true) | length > 0)
+          }}
+      when:
+        - not (_gitops_svc_lookup.failed | default(false))
+        - _gitops_svc_lookup.resources | default([]) | length > 0
+
+    - name: Wait for LoadBalancer ingress when Service exists but endpoint not ready yet
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: "{{ _gitops_resolved_service_name | default(gitops_vms_service_name) }}"
+        namespace: "{{ gitops_vms_namespace }}"
+        validate_certs: "{{ gitops_vm_lb_k8s_validate_certs | default(false) | bool }}"
+        kubeconfig: "{{ _gitops_kubeconfig_path }}"
+        context: "{{ gitops_vm_lb_k8s_context | default(omit, true) }}"
+      environment: "{{ _gitops_k8s_env }}"
+      register: _gitops_svc_wait
+      until: >-
+        (
+          _gitops_svc_wait.resources | default([]) | length > 0
+          and (
+            (
+              (
+                (
+                  (_gitops_svc_wait.resources[0].status | default({}))['loadBalancer'] | default({}, true)
+                )['ingress'] | default([], true)
+              )
+              | first | default({})
+            ).hostname | default('')
+            | length > 0
+            or (
+              (
+                (
+                  (
+                    (_gitops_svc_wait.resources[0].status | default({}))['loadBalancer'] | default({}, true)
+                  )['ingress'] | default([], true)
+                )
+                | first | default({})
+              ).ip | default('')
+              | length > 0
+            )
+          )
+        )
+      retries: "{{ k8s_service_wait_retries | int }}"
+      delay: "{{ k8s_service_wait_delay | int }}"
+      failed_when: false
+      when:
+        - not (_gitops_svc_lookup.failed | default(false))
+        - _gitops_svc_lookup.resources | default([]) | length > 0
+        - not (_gitops_lb_has_endpoint | default(false) | bool)
+
   vars:
-    _ingress: "{{ _gitops_svc_probe.resources[0].status.loadBalancer.ingress | default([]) | first | default({}) }}"
+    _gitops_kubeconfig_path: "{{ kubeconfig_dir | default('/tmp/kubeconfigs') }}/{{ item }}.yaml"
+    _gitops_k8s_env: >-
+      {{
+        {
+          'KUBECONFIG': _gitops_kubeconfig_path,
+          'K8S_AUTH_KUBECONFIG': _gitops_kubeconfig_path,
+          'PATH': lookup('env', 'PATH') | default('/usr/local/bin:/usr/bin:/bin', true),
+          'HOME': lookup('env', 'HOME') | default('/root', true),
+          'USER': lookup('env', 'USER') | default('root', true),
+        }
+        | combine({'K8S_AUTH_CONTEXT': gitops_vm_lb_k8s_context} if (gitops_vm_lb_k8s_context | default('') | length > 0) else {})
+        | combine(gitops_vm_lb_k8s_extra_env | default({}))
+      }}
+
+- name: Merge Service lookup and optional ingress wait (avoid stale register when wait is skipped)
+  ansible.builtin.set_fact:
+    _gitops_svc_probe: "{{ _gitops_svc_wait if _use_wait_result else _gitops_svc_lookup }}"
+  vars:
+    _needs_ingress_wait: >-
+      {{
+        (not (_gitops_svc_lookup.failed | default(false)))
+        and (_gitops_svc_lookup.resources | default([]) | length > 0)
+        and not (_gitops_lb_has_endpoint | default(false) | bool)
+      }}
+    _use_wait_result: >-
+      {{
+        (_needs_ingress_wait | bool)
+        and (_gitops_svc_wait is defined)
+        and not (_gitops_svc_wait.failed | default(false))
+        and (_gitops_svc_wait.resources | default([]) | length > 0)
+      }}
+
+- name: Derive ingress list from merged probe for Record task
+  ansible.builtin.set_fact:
+    _gitops_probe_lb_ingress_list: "{{ _gitops_probe_ingress_from_status }}"
+  vars:
+    _pst: "{{ _gitops_svc_probe.resources[0].status | default({}) }}"
+    _plb: "{{ _pst['loadBalancer'] | default({}, true) }}"
+    _gitops_probe_ingress_from_status: "{{ _plb['ingress'] | default([], true) }}"
   when:
     - not (_gitops_svc_probe.failed | default(false))
     - _gitops_svc_probe.resources | default([]) | length > 0
-    - (_ingress.hostname | default('') | length > 0) or (_ingress.ip | default('') | length > 0)
+
+- name: Record which cluster runs the Service and the LB hostname or IP from status
+  ansible.builtin.set_fact:
+    vm_service_discovered: true
+    discovered_cluster: "{{ item }}"
+    discovered_lb_fqdn: "{{ _ingress.hostname | default('', true) | regex_replace('[.]$', '') }}"
+    inventory_ansible_host: "{{ _ingress.hostname | default(_ingress.ip, true) | regex_replace('[.]$', '') }}"
+  vars:
+    _ingress: "{{ _gitops_probe_lb_ingress_list | default([]) | first | default({}) }}"
+  when:
+    - not (_gitops_svc_probe.failed | default(false))
+    - _gitops_svc_probe.resources | default([]) | length > 0
+    - (_ingress['hostname'] | default('') | length > 0) or (_ingress['ip'] | default('') | length > 0)
+
+- name: Resolve Service ingress FQDN to IPv4 via system DNS (dig uses /etc/resolv.conf)
+  ansible.builtin.command:
+    argv:
+      - dig
+      - +short
+      - "{{ discovered_lb_fqdn }}"
+      - A
+  register: _lb_svc_fqdn_dig
+  changed_when: false
+  failed_when: false
+  when:
+    - discovered_lb_fqdn | default('') | length > 0
+
+- name: Pick first IPv4 from lookup of Service FQDN
+  ansible.builtin.set_fact:
+    _lb_resolved_ipv4: >-
+      {{
+        _lb_svc_fqdn_dig.stdout_lines
+        | map('trim')
+        | reject('equalto', '')
+        | select('match', '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')
+        | list
+        | first
+        | default('', true)
+      }}
+  when:
+    - discovered_lb_fqdn | default('') | length > 0
+    - _lb_svc_fqdn_dig is defined
+
+- name: Use resolved IPv4 for ansible_host when FQDN lookup succeeded
+  ansible.builtin.set_fact:
+    inventory_ansible_host: "{{ _lb_resolved_ipv4 }}"
+  when:
+    - _lb_resolved_ipv4 | default('') | length > 0

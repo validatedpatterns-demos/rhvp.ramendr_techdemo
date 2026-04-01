@@ -1,0 +1,34 @@
+---
+# Hosted zone name (e.g. aws.validatedpatterns.io)
+route53_zone: ""
+
+# Failover CNAME at the hub (public name clients use)
+route53_alb_record: ""
+
+# PRIMARY / SECONDARY target FQDNs (managed cluster hostnames)
+route53_primary_record: ""
+route53_secondary_record: ""
+
+# TCP | HTTP | HTTPS | HTTP_STR_MATCH | HTTPS_STR_MATCH
+route53_health_check_type: TCP
+
+# Port for the health check (SSH 22, HTTP 80, HTTPS 443, etc.)
+route53_health_check_port: 22
+
+# Required for non-TCP checks (path must start with /)
+route53_health_check_resource_path: /
+
+# Optional body substring for *_STR_MATCH types
+route53_health_check_string_match: ""
+
+route53_health_check_request_interval: 10
+route53_health_check_failure_threshold: 3
+
+route53_ttl: 30
+
+# Route53 failover record identifiers (unique per DNS name + type within the zone)
+route53_failover_primary_identifier: primary
+route53_failover_secondary_identifier: secondary
+
+# Optional override when deleting PRIMARY without a successful lookup
+route53_primary_health_check_id: ""
